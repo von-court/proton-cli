@@ -24,6 +24,7 @@ type Event struct {
 	Location    string                 `json:"location,omitempty"`
 	Description string                 `json:"description,omitempty"`
 	RRule       string                 `json:"rrule,omitempty"`
+	ICS         string                 `json:"ical,omitempty"`
 	Start       time.Time              `json:"start"`
 	End         time.Time              `json:"end"`
 	AllDay      bool                   `json:"all_day"`
@@ -83,11 +84,11 @@ type rawAttendee struct {
 }
 
 func (e rawEvent) toEvent(ck *calKeys) Event {
-	title, location, description, rrule, _, sig := decryptEventCard(e.SharedEvents, e.SharedKeyPacket, ck.calKR, ck.addrKR)
+	title, location, description, rrule, _, ics, sig := decryptEventCard(e.SharedEvents, e.SharedKeyPacket, ck.calKR, ck.addrKR)
 	return Event{
 		ID: e.ID, CalendarID: e.CalendarID, Title: title, Location: location, Description: description, RRule: rrule,
 		Start: time.Unix(e.StartTime, 0), End: time.Unix(e.EndTime, 0),
-		AllDay: e.FullDay == 1, UID: e.UID, Signature: sig,
+		AllDay: e.FullDay == 1, UID: e.UID, ICS: ics, Signature: sig,
 	}
 }
 
@@ -270,7 +271,7 @@ func (s *Service) EventUpdate(ctx context.Context, u *keys.Unlocked, calendarID,
 		return err
 	}
 
-	curTitle, curLoc, curDesc, curRRule, curOrganizer, _ := decryptEventCard(r.Event.SharedEvents, r.Event.SharedKeyPacket, ck.calKR, ck.addrKR)
+	curTitle, curLoc, curDesc, curRRule, curOrganizer, _, _ := decryptEventCard(r.Event.SharedEvents, r.Event.SharedKeyPacket, ck.calKR, ck.addrKR)
 	if title == "" {
 		title = curTitle
 	}

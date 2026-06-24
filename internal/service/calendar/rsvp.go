@@ -177,7 +177,7 @@ func (s *Service) EventRespond(ctx context.Context, u *keys.Unlocked, calendarID
 				packet, decKR = ev.AddressKeyPacket, kr
 			}
 		}
-		title, location, _, _, organizer, _ := decryptEventCard(ev.SharedEvents, packet, decKR, ck.addrKR)
+		title, location, _, _, organizer, _, _ := decryptEventCard(ev.SharedEvents, packet, decKR, ck.addrKR)
 		res.Title = title
 		if organizer != "" && !strings.EqualFold(organizer, selfEmail) {
 			start := time.Unix(ev.StartTime, 0)

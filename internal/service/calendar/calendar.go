@@ -128,15 +128,18 @@ func (s *Service) unlockCalendar(ctx context.Context, u *keys.Unlocked, calendar
 // session key is wrapped to decryptionKR (the calendar key for organizer
 // copies, or the invited address key for received invitations) via keyPacket;
 // signatures are checked against verificationKR.
-func decryptEventCard(cards []map[string]any, keyPacket string, decryptionKR, verificationKR *pgp.KeyRing) (title, location, description, rrule, organizer string, sig pgphelper.VerifyResult) {
+// ics is the full decrypted iCalendar text, which also carries DTSTART;TZID, DTEND, EXDATE
+// and RECURRENCE-ID. Callers expanding a recurring series need it: the API returns only a
+// single master event at the series start.
+func decryptEventCard(cards []map[string]any, keyPacket string, decryptionKR, verificationKR *pgp.KeyRing) (title, location, description, rrule, organizer, ics string, sig pgphelper.VerifyResult) {
 	kp, _ := base64.StdEncoding.DecodeString(keyPacket)
 	decrypted, verdicts, err := pgphelper.DecryptCardsRaw(cards, decryptionKR, verificationKR, kp)
 	if err != nil {
-		return "", "", "", "", "", pgphelper.Unverified
+		return "", "", "", "", "", "", pgphelper.Unverified
 	}
 	joined := strings.Join(decrypted, "\n")
 	organizer = strings.TrimPrefix(ical.Field(joined, "ORGANIZER"), "mailto:")
-	return ical.Field(joined, "SUMMARY"), ical.Field(joined, "LOCATION"), ical.Field(joined, "DESCRIPTION"), ical.Field(joined, "RRULE"), organizer, pgphelper.Aggregate(verdicts...)
+	return ical.Field(joined, "SUMMARY"), ical.Field(joined, "LOCATION"), ical.Field(joined, "DESCRIPTION"), ical.Field(joined, "RRULE"), organizer, joined, pgphelper.Aggregate(verdicts...)
 }
 
 func DefaultRange() (time.Time, time.Time) {
