@@ -38,6 +38,8 @@ type Event struct {
 	End        time.Time              `json:"end"`
 	AllDay     bool                   `json:"all_day"`
 	UID        string                 `json:"uid,omitempty"`
+	RRule      string                 `json:"rrule,omitempty"`
+	ICS        string                 `json:"ical,omitempty"`
 	Signature  pgphelper.VerifyResult `json:"signature,omitempty"`
 }
 
@@ -156,11 +158,11 @@ type rawEvent struct {
 }
 
 func (e rawEvent) toEvent(ck *calKeys) Event {
-	title, location, sig := decryptTitleLocation(e.SharedEvents, e.SharedKeyPacket, ck)
+	title, location, rrule, ics, sig := decryptTitleLocation(e.SharedEvents, e.SharedKeyPacket, ck)
 	return Event{
 		ID: e.ID, CalendarID: e.CalendarID, Title: title, Location: location,
 		Start: time.Unix(e.StartTime, 0), End: time.Unix(e.EndTime, 0),
-		AllDay: e.FullDay == 1, UID: e.UID, Signature: sig,
+		AllDay: e.FullDay == 1, UID: e.UID, RRule: rrule, ICS: ics, Signature: sig,
 	}
 }
 
@@ -238,7 +240,7 @@ func (s *Service) EventUpdate(ctx context.Context, u *keys.Unlocked, calendarID,
 		return err
 	}
 
-	curTitle, curLoc, _ := decryptTitleLocation(r.Event.SharedEvents, r.Event.SharedKeyPacket, ck)
+	curTitle, curLoc, _, _, _ := decryptTitleLocation(r.Event.SharedEvents, r.Event.SharedKeyPacket, ck)
 	if title == "" {
 		title = curTitle
 	}
@@ -418,14 +420,18 @@ func (s *Service) unlockCalendar(ctx context.Context, u *keys.Unlocked, calendar
 	return &calKeys{calKR: calKR, addrKR: addrKR, memberID: memberID}, nil
 }
 
-func decryptTitleLocation(cards []map[string]any, keyPacket string, ck *calKeys) (string, string, pgphelper.VerifyResult) {
+// Returns the event's title and location plus, for recurring events, the RRULE and the full
+// decrypted iCalendar text (which also carries DTSTART;TZID, DTEND and EXDATE) so callers can
+// expand occurrences. The recurrence data is already decrypted here; upstream only used the
+// title/location.
+func decryptTitleLocation(cards []map[string]any, keyPacket string, ck *calKeys) (title, location, rrule, ics string, sig pgphelper.VerifyResult) {
 	kp, _ := base64.StdEncoding.DecodeString(keyPacket)
 	decrypted, verdicts, err := pgphelper.DecryptCardsRaw(cards, ck.calKR, ck.addrKR, kp)
 	if err != nil {
-		return "", "", pgphelper.Unverified
+		return "", "", "", "", pgphelper.Unverified
 	}
 	joined := strings.Join(decrypted, "\n")
-	return ical.Field(joined, "SUMMARY"), ical.Field(joined, "LOCATION"), pgphelper.Aggregate(verdicts...)
+	return ical.Field(joined, "SUMMARY"), ical.Field(joined, "LOCATION"), ical.Field(joined, "RRULE"), joined, pgphelper.Aggregate(verdicts...)
 }
 
 func DefaultRange() (time.Time, time.Time) {
