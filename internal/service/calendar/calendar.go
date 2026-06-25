@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -240,7 +241,7 @@ func (s *Service) EventUpdate(ctx context.Context, u *keys.Unlocked, calendarID,
 		return err
 	}
 
-	curTitle, curLoc, _, _, _ := decryptTitleLocation(r.Event.SharedEvents, r.Event.SharedKeyPacket, ck)
+	curTitle, curLoc, _, curICS, _ := decryptTitleLocation(r.Event.SharedEvents, r.Event.SharedKeyPacket, ck)
 	if title == "" {
 		title = curTitle
 	}
@@ -254,7 +255,17 @@ func (s *Service) EventUpdate(ctx context.Context, u *keys.Unlocked, calendarID,
 		end = time.Unix(r.Event.EndTime, 0)
 	}
 
-	signed := ical.SignedVEVENT(r.Event.UID, start, end, r.Event.FullDay == 1, 1)
+	// SEQUENCE must strictly increase or Proton ignores the revision (RFC 5545 §3.8.7.4),
+	// silently keeping the stored event — so a second edit of the same event would no-op.
+	// Read the current SEQUENCE from the decrypted card and bump it (default 0 -> 1).
+	seq := 1
+	if cur := strings.TrimSpace(ical.Field(curICS, "SEQUENCE")); cur != "" {
+		if n, err := strconv.Atoi(cur); err == nil {
+			seq = n + 1
+		}
+	}
+
+	signed := ical.SignedVEVENT(r.Event.UID, start, end, r.Event.FullDay == 1, seq)
 	encrypted := ical.EncryptedVEVENT(title, location)
 	signedCard, encCard, _, err := pgphelper.EncryptAndSignCardSplit(signed, encrypted, ck.calKR, ck.addrKR, r.Event.SharedKeyPacket)
 	if err != nil {
