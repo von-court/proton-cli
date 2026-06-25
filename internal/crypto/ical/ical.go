@@ -42,8 +42,10 @@ func ContactUID() string {
 }
 
 // SignedVEVENT builds the signed portion of a Proton calendar event
-// (Card Type 2: UID + DTSTAMP + DTSTART + DTEND + SEQUENCE).
-func SignedVEVENT(uid string, start, end time.Time, allDay bool, sequence int) string {
+// (Card Type 2: UID + DTSTAMP + DTSTART + DTEND + SEQUENCE). Any `extra` lines (e.g.
+// RRULE / EXDATE / RDATE preserved from an existing event) are emitted inside the VEVENT
+// so an update of a recurring event keeps its series structure instead of flattening it.
+func SignedVEVENT(uid string, start, end time.Time, allDay bool, sequence int, extra ...string) string {
 	dtstamp := time.Now().UTC().Format("20060102T150405Z")
 	var dtstart, dtend string
 	if allDay {
@@ -53,15 +55,17 @@ func SignedVEVENT(uid string, start, end time.Time, allDay bool, sequence int) s
 		dtstart = "DTSTART:" + start.UTC().Format("20060102T150405Z")
 		dtend = "DTEND:" + end.UTC().Format("20060102T150405Z")
 	}
-	return strings.Join([]string{
+	lines := []string{
 		"BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//proton-cli//EN",
 		"BEGIN:VEVENT",
 		"UID:" + uid,
 		"DTSTAMP:" + dtstamp,
 		dtstart, dtend,
 		fmt.Sprintf("SEQUENCE:%d", sequence),
-		"END:VEVENT", "END:VCALENDAR",
-	}, "\r\n")
+	}
+	lines = append(lines, extra...)
+	lines = append(lines, "END:VEVENT", "END:VCALENDAR")
+	return strings.Join(lines, "\r\n")
 }
 
 // EncryptedVEVENT builds the encrypted portion of a Proton calendar event

@@ -265,7 +265,22 @@ func (s *Service) EventUpdate(ctx context.Context, u *keys.Unlocked, calendarID,
 		}
 	}
 
-	signed := ical.SignedVEVENT(r.Event.UID, start, end, r.Event.FullDay == 1, seq)
+	// Preserve the series structure (recurrence rule + exception/extra dates) so editing a
+	// recurring event keeps it recurring instead of collapsing it to a single occurrence.
+	// (DTSTART is rewritten in UTC; a series anchored to a local zone that crosses a DST
+	// boundary could drift by an hour — acceptable for now, noted as a follow-up.)
+	var recur []string
+	for _, line := range strings.Split(curICS, "\n") {
+		l := strings.TrimSpace(line)
+		switch u := strings.ToUpper(l); {
+		case strings.HasPrefix(u, "RRULE:"),
+			strings.HasPrefix(u, "EXDATE:"), strings.HasPrefix(u, "EXDATE;"),
+			strings.HasPrefix(u, "RDATE:"), strings.HasPrefix(u, "RDATE;"):
+			recur = append(recur, l)
+		}
+	}
+
+	signed := ical.SignedVEVENT(r.Event.UID, start, end, r.Event.FullDay == 1, seq, recur...)
 	encrypted := ical.EncryptedVEVENT(title, location)
 	signedCard, encCard, _, err := pgphelper.EncryptAndSignCardSplit(signed, encrypted, ck.calKR, ck.addrKR, r.Event.SharedKeyPacket)
 	if err != nil {
