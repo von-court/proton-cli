@@ -44,6 +44,13 @@ func ContactUID() string {
 // SignedVEVENT builds the signed portion of a Proton calendar event
 // (Card Type 2: UID + DTSTAMP + DTSTART + DTEND + SEQUENCE).
 func SignedVEVENT(uid string, start, end time.Time, allDay bool, sequence int) string {
+	return SignedVEVENTEx(uid, start, end, allDay, sequence, nil)
+}
+
+// SignedVEVENTEx is SignedVEVENT with optional extra component lines (e.g. RRULE,
+// RECURRENCE-ID, EXDATE) inserted after DTEND. Recurring writes need these — plain
+// SignedVEVENT carries none, which would silently strip recurrence from a series.
+func SignedVEVENTEx(uid string, start, end time.Time, allDay bool, sequence int, extra []string) string {
 	dtstamp := time.Now().UTC().Format("20060102T150405Z")
 	var dtstart, dtend string
 	if allDay {
@@ -53,15 +60,93 @@ func SignedVEVENT(uid string, start, end time.Time, allDay bool, sequence int) s
 		dtstart = "DTSTART:" + start.UTC().Format("20060102T150405Z")
 		dtend = "DTEND:" + end.UTC().Format("20060102T150405Z")
 	}
-	return strings.Join([]string{
+	lines := []string{
 		"BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//proton-cli//EN",
 		"BEGIN:VEVENT",
 		"UID:" + uid,
 		"DTSTAMP:" + dtstamp,
 		dtstart, dtend,
-		fmt.Sprintf("SEQUENCE:%d", sequence),
-		"END:VEVENT", "END:VCALENDAR",
-	}, "\r\n")
+	}
+	for _, e := range extra {
+		if strings.TrimSpace(e) != "" {
+			lines = append(lines, e)
+		}
+	}
+	lines = append(lines, fmt.Sprintf("SEQUENCE:%d", sequence), "END:VEVENT", "END:VCALENDAR")
+	return strings.Join(lines, "\r\n")
+}
+
+// RecurrenceIDLine builds a RECURRENCE-ID line for an occurrence's original start.
+// Timed occurrences use a UTC instant (absolute, DST-safe); all-day uses VALUE=DATE.
+func RecurrenceIDLine(t time.Time, allDay bool) string {
+	if allDay {
+		return "RECURRENCE-ID;VALUE=DATE:" + t.Format("20060102")
+	}
+	return "RECURRENCE-ID:" + t.UTC().Format("20060102T150405Z")
+}
+
+// RecurrenceLines pulls the RRULE / RECURRENCE-ID / EXDATE lines (verbatim) out of decrypted
+// iCalendar text so an in-place update can re-emit them unchanged — this is what keeps a series
+// recurring (and an override an override) across an EventUpdate.
+func RecurrenceLines(ics string) []string {
+	var out []string
+	for _, line := range strings.Split(unfold(ics), "\n") {
+		line = strings.TrimSpace(line)
+		u := strings.ToUpper(line)
+		if strings.HasPrefix(u, "RRULE:") || strings.HasPrefix(u, "RECURRENCE-ID") || strings.HasPrefix(u, "EXDATE") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// EXDATELines returns only the EXDATE lines from decrypted iCalendar text.
+func EXDATELines(ics string) []string {
+	var out []string
+	for _, l := range RecurrenceLines(ics) {
+		if strings.HasPrefix(strings.ToUpper(l), "EXDATE") {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// TruncateRRULE drops any existing UNTIL/COUNT and appends UNTIL=<until, UTC>, ending a series
+// just before a split point. The rrule argument is the bare value, e.g. "FREQ=DAILY;BYDAY=MO".
+func TruncateRRULE(rrule string, until time.Time) string {
+	parts := stripRRuleKeys(rrule, "UNTIL", "COUNT")
+	parts = append(parts, "UNTIL="+until.UTC().Format("20060102T150405Z"))
+	return strings.Join(parts, ";")
+}
+
+// StripUntilCount removes UNTIL/COUNT, yielding an open-ended rule for a split remainder.
+func StripUntilCount(rrule string) string {
+	return strings.Join(stripRRuleKeys(rrule, "UNTIL", "COUNT"), ";")
+}
+
+func stripRRuleKeys(rrule string, drop ...string) []string {
+	dropSet := map[string]bool{}
+	for _, d := range drop {
+		dropSet[strings.ToUpper(d)] = true
+	}
+	var parts []string
+	for _, p := range strings.Split(rrule, ";") {
+		if p == "" {
+			continue
+		}
+		key := strings.ToUpper(strings.SplitN(p, "=", 2)[0])
+		if dropSet[key] {
+			continue
+		}
+		parts = append(parts, p)
+	}
+	return parts
+}
+
+// unfold collapses RFC 5545 line folding (CRLF/LF followed by space or tab).
+func unfold(text string) string {
+	r := strings.NewReplacer("\r\n ", "", "\r\n\t", "", "\n ", "", "\n\t", "")
+	return r.Replace(text)
 }
 
 // EncryptedVEVENT builds the encrypted portion of a Proton calendar event
