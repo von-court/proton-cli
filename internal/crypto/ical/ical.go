@@ -5,9 +5,25 @@ package ical
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// Sequence returns the VEVENT SEQUENCE from decrypted iCalendar text (0 if absent). Proton
+// rejects a single-occurrence override whose SEQUENCE is below the master's (code 2001), and
+// expects an update's SEQUENCE to not regress, so writes must read and respect it.
+func Sequence(ics string) int {
+	for _, line := range strings.Split(unfold(ics), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToUpper(line), "SEQUENCE:") {
+			if n, err := strconv.Atoi(strings.TrimSpace(line[len("SEQUENCE:"):])); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
 
 // Field extracts a field value from iCal/vCard text. Handles both
 // `FIELD:value` and `FIELD;PARAM=x:value` forms, plus `itemN.FIELD:…`.
@@ -76,13 +92,74 @@ func SignedVEVENTEx(uid string, start, end time.Time, allDay bool, sequence int,
 	return strings.Join(lines, "\r\n")
 }
 
-// RecurrenceIDLine builds a RECURRENCE-ID line for an occurrence's original start.
-// Timed occurrences use a UTC instant (absolute, DST-safe); all-day uses VALUE=DATE.
-func RecurrenceIDLine(t time.Time, allDay bool) string {
-	if allDay {
-		return "RECURRENCE-ID;VALUE=DATE:" + t.Format("20060102")
+// dateLine builds a DTSTART/DTEND/RECURRENCE-ID line. The value type/zone MUST match the series'
+// DTSTART or a calendar server won't recognise an override: all-day → VALUE=DATE; a zoned series →
+// TZID=<zone> with local wall-clock; otherwise a UTC instant.
+func dateLine(name string, t time.Time, tzid string, isDate bool) string {
+	if isDate {
+		return name + ";VALUE=DATE:" + t.Format("20060102")
 	}
-	return "RECURRENCE-ID:" + t.UTC().Format("20060102T150405Z")
+	if tzid != "" {
+		if loc, err := time.LoadLocation(tzid); err == nil {
+			return name + ";TZID=" + tzid + ":" + t.In(loc).Format("20060102T150405")
+		}
+	}
+	return name + ":" + t.UTC().Format("20060102T150405Z")
+}
+
+// RecurrenceIDLine builds a RECURRENCE-ID line for an occurrence's original start, in the series'
+// own value type/zone so the override attaches to the right instance.
+func RecurrenceIDLine(t time.Time, tzid string, isDate bool) string {
+	return dateLine("RECURRENCE-ID", t, tzid, isDate)
+}
+
+// DTStartInfo reports the TZID and DATE-ness of the first DTSTART in decrypted iCalendar text, so
+// overrides/shifts/splits can re-express times in the series' own zone.
+func DTStartInfo(ics string) (tzid string, isDate bool) {
+	for _, line := range strings.Split(unfold(ics), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToUpper(line), "DTSTART") {
+			continue
+		}
+		colon := strings.Index(line, ":")
+		if colon < 0 {
+			return
+		}
+		for _, p := range strings.Split(line[:colon], ";")[1:] {
+			kv := strings.SplitN(p, "=", 2)
+			if len(kv) != 2 {
+				continue
+			}
+			if strings.EqualFold(kv[0], "TZID") {
+				tzid = kv[1]
+			} else if strings.EqualFold(kv[0], "VALUE") && strings.EqualFold(kv[1], "DATE") {
+				isDate = true
+			}
+		}
+		return
+	}
+	return
+}
+
+// SignedVEVENTZoned is SignedVEVENTEx but writes DTSTART/DTEND in the given zone (or VALUE=DATE for
+// all-day), so recurring writes preserve the series' TZID instead of collapsing to UTC.
+func SignedVEVENTZoned(uid string, start, end time.Time, tzid string, isDate bool, sequence int, extra []string) string {
+	dtstamp := time.Now().UTC().Format("20060102T150405Z")
+	lines := []string{
+		"BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//proton-cli//EN",
+		"BEGIN:VEVENT",
+		"UID:" + uid,
+		"DTSTAMP:" + dtstamp,
+		dateLine("DTSTART", start, tzid, isDate),
+		dateLine("DTEND", end, tzid, isDate),
+	}
+	for _, e := range extra {
+		if strings.TrimSpace(e) != "" {
+			lines = append(lines, e)
+		}
+	}
+	lines = append(lines, fmt.Sprintf("SEQUENCE:%d", sequence), "END:VEVENT", "END:VCALENDAR")
+	return strings.Join(lines, "\r\n")
 }
 
 // RecurrenceLines pulls the RRULE / RECURRENCE-ID / EXDATE lines (verbatim) out of decrypted

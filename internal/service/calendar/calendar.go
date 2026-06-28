@@ -231,7 +231,9 @@ func (s *Service) EventUpdate(ctx context.Context, u *keys.Unlocked, calendarID,
 
 	// Re-emit any RRULE / RECURRENCE-ID / EXDATE so an in-place edit preserves recurrence (a plain
 	// SignedVEVENT carries none, which would turn a series — or an override — into a one-off event).
-	signed := ical.SignedVEVENTEx(r.Event.UID, start, end, r.Event.FullDay == 1, 1, ical.RecurrenceLines(curICS))
+	// Bump SEQUENCE from the current value so it never regresses (Proton rejects that, and an
+	// override must stay >= its master).
+	signed := ical.SignedVEVENTEx(r.Event.UID, start, end, r.Event.FullDay == 1, ical.Sequence(curICS)+1, ical.RecurrenceLines(curICS))
 	encrypted := ical.EncryptedVEVENT(title, location)
 	signedCard, encCard, _, err := pgphelper.EncryptAndSignCardSplit(signed, encrypted, ck.calKR, ck.addrKR, r.Event.SharedKeyPacket)
 	if err != nil {
@@ -276,6 +278,7 @@ type masterInfo struct {
 	location  string
 	rrule     string
 	ics       string
+	seq       int
 }
 
 func (s *Service) loadMaster(ctx context.Context, ck *calKeys, calendarID, eventID string) (*masterInfo, error) {
@@ -297,6 +300,7 @@ func (s *Service) loadMaster(ctx context.Context, ck *calKeys, calendarID, event
 		uid: r.Event.UID, allDay: r.Event.FullDay == 1,
 		start: time.Unix(r.Event.StartTime, 0), end: time.Unix(r.Event.EndTime, 0),
 		keyPacket: r.Event.SharedKeyPacket, title: title, location: loc, rrule: rrule, ics: ics,
+		seq: ical.Sequence(ics),
 	}, nil
 }
 
@@ -323,14 +327,27 @@ func (s *Service) putNewEvent(ctx context.Context, ck *calKeys, calendarID, sign
 	}
 	var r struct {
 		Responses []struct {
-			Response struct{ Event struct{ ID string } }
+			Response struct {
+				Code  int
+				Error string
+				Event struct{ ID string }
+			}
 		}
 	}
 	if err := s.C.Decode(ctx, proton.Request{Method: "PUT", Path: "/calendar/v1/" + calendarID + "/events/sync", Body: body}, &r); err != nil {
 		return "", err
 	}
+	// The sync endpoint returns HTTP 200 even when an individual event is rejected; the real
+	// status is the per-event Code (1000 = success). Surface a rejection instead of silently
+	// returning an empty id.
 	if len(r.Responses) > 0 {
-		return r.Responses[0].Response.Event.ID, nil
+		resp := r.Responses[0].Response
+		if resp.Event.ID != "" {
+			return resp.Event.ID, nil
+		}
+		if resp.Code != 0 && resp.Code != 1000 {
+			return "", fmt.Errorf("proton rejected event (code %d): %s", resp.Code, resp.Error)
+		}
 	}
 	return "", nil
 }
@@ -375,7 +392,12 @@ func (s *Service) EventCreateOverride(ctx context.Context, u *keys.Unlocked, cal
 	if location == "" {
 		location = m.location
 	}
-	signed := ical.SignedVEVENTEx(m.uid, start, end, m.allDay, 0, []string{ical.RecurrenceIDLine(recurrenceID, m.allDay)})
+	// RECURRENCE-ID and the override's own DTSTART must be in the series' value type/zone, or a
+	// TZID-anchored series (e.g. Google-synced) won't recognise the override and it's dropped.
+	tzid, isDate := ical.DTStartInfo(m.ics)
+	rid := ical.RecurrenceIDLine(recurrenceID, tzid, isDate)
+	// Proton requires an override's SEQUENCE >= the master's (code 2001 otherwise).
+	signed := ical.SignedVEVENTZoned(m.uid, start, end, tzid, isDate, m.seq, []string{rid})
 	encrypted := ical.EncryptedVEVENT(title, location)
 	return s.putNewEvent(ctx, ck, calendarID, signed, encrypted)
 }
@@ -400,7 +422,8 @@ func (s *Service) EventShiftSeries(ctx context.Context, u *keys.Unlocked, calend
 	delta := newStart.Sub(recurrenceID)
 	mStart := m.start.Add(delta)
 	mEnd := mStart.Add(newEnd.Sub(newStart))
-	signed := ical.SignedVEVENTEx(m.uid, mStart, mEnd, m.allDay, 1, ical.RecurrenceLines(m.ics))
+	tzid, isDate := ical.DTStartInfo(m.ics)
+	signed := ical.SignedVEVENTZoned(m.uid, mStart, mEnd, tzid, isDate, m.seq+1, ical.RecurrenceLines(m.ics))
 	encrypted := ical.EncryptedVEVENT(title, location)
 	return s.putUpdateEvent(ctx, ck, calendarID, masterEventID, signed, encrypted, m.keyPacket)
 }
@@ -426,15 +449,17 @@ func (s *Service) EventSplitFollowing(ctx context.Context, u *keys.Unlocked, cal
 	if location == "" {
 		location = m.location
 	}
-	// 1. Truncate the master so it ends just before the split, keeping its DTSTART and EXDATEs.
+	// 1. Truncate the master so it ends just before the split, keeping its DTSTART/zone and EXDATEs.
+	// (RFC 5545: UNTIL is UTC even when DTSTART is zoned, which TruncateRRULE already does.)
+	tzid, isDate := ical.DTStartInfo(m.ics)
 	truncExtra := append([]string{"RRULE:" + ical.TruncateRRULE(m.rrule, recurrenceID.Add(-time.Second))}, ical.EXDATELines(m.ics)...)
-	masterSigned := ical.SignedVEVENTEx(m.uid, m.start, m.end, m.allDay, 1, truncExtra)
+	masterSigned := ical.SignedVEVENTZoned(m.uid, m.start, m.end, tzid, isDate, m.seq+1, truncExtra)
 	encrypted := ical.EncryptedVEVENT(m.title, m.location)
 	if err := s.putUpdateEvent(ctx, ck, calendarID, masterEventID, masterSigned, encrypted, m.keyPacket); err != nil {
 		return err
 	}
-	// 2. Create the remainder as a new series at the dragged time.
-	newSigned := ical.SignedVEVENTEx(ical.EventUID(), newStart, newEnd, m.allDay, 0, []string{"RRULE:" + ical.StripUntilCount(m.rrule)})
+	// 2. Create the remainder as a new series at the dragged time, in the same zone.
+	newSigned := ical.SignedVEVENTZoned(ical.EventUID(), newStart, newEnd, tzid, isDate, 0, []string{"RRULE:" + ical.StripUntilCount(m.rrule)})
 	newEncrypted := ical.EncryptedVEVENT(title, location)
 	_, err = s.putNewEvent(ctx, ck, calendarID, newSigned, newEncrypted)
 	return err
