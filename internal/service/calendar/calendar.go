@@ -122,26 +122,43 @@ func (s *Service) ResolveCalendarID(ctx context.Context, nameOrID string) (strin
 	return "", &errs.NotFound{Kind: "calendar", Ref: nameOrID}
 }
 
+const (
+	// The API caps a page of events at 100 and reports no total, so a window holding more than
+	// that must be walked page by page or the tail is silently lost.
+	eventsPageSize = 100
+	eventsMaxPages = 100
+)
+
 func (s *Service) EventsList(ctx context.Context, u *keys.Unlocked, calendarID string, start, end time.Time) ([]Event, error) {
 	ck, err := s.unlockCalendar(ctx, u, calendarID)
 	if err != nil {
 		return nil, err
 	}
-	q := url.Values{}
-	q.Set("Start", fmt.Sprintf("%d", start.Unix()))
-	q.Set("End", fmt.Sprintf("%d", end.Unix()))
-	q.Set("Timezone", "UTC")
-	q.Set("Type", "0")
+	var out []Event
+	for page := 0; page < eventsMaxPages; page++ {
+		q := url.Values{}
+		q.Set("Start", fmt.Sprintf("%d", start.Unix()))
+		q.Set("End", fmt.Sprintf("%d", end.Unix()))
+		q.Set("Timezone", "UTC")
+		q.Set("Type", "0")
+		q.Set("Page", fmt.Sprintf("%d", page))
+		q.Set("PageSize", fmt.Sprintf("%d", eventsPageSize))
 
-	var r struct {
-		Events []rawEvent
-	}
-	if err := s.C.Decode(ctx, proton.Request{Method: "GET", Path: "/calendar/v1/" + calendarID + "/events", Query: q}, &r); err != nil {
-		return nil, err
-	}
-	out := make([]Event, 0, len(r.Events))
-	for _, e := range r.Events {
-		out = append(out, e.toEvent(ck))
+		var r struct {
+			Events []rawEvent
+		}
+		if err := s.C.Decode(ctx, proton.Request{Method: "GET", Path: "/calendar/v1/" + calendarID + "/events", Query: q}, &r); err != nil {
+			return nil, err
+		}
+		if len(r.Events) == 0 {
+			break
+		}
+		for _, e := range r.Events {
+			out = append(out, e.toEvent(ck))
+		}
+		if len(r.Events) < eventsPageSize {
+			break
+		}
 	}
 	return out, nil
 }
