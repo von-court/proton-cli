@@ -81,6 +81,59 @@ func TestPreprocessArgs(t *testing.T) {
 			t.Errorf("preprocessArgs altered args with real flag: got %v, want %v", got, in)
 		}
 	})
+	// A dashed id used as a FLAG VALUE must stay glued to its flag: injecting the
+	// terminator between them would hand --calendar the value "--" and strand the id.
+	t.Run("dashed ID as a long-flag value is left glued to its flag", func(t *testing.T) {
+		in := []string{"proton-cli", "calendar", "events", "create", "--calendar", dashedID, "--title", "x"}
+		if got := preprocessArgs(in); !equalSlice(got, in) {
+			t.Errorf("preprocessArgs split a flag from its value: got %v, want %v", got, in)
+		}
+	})
+	t.Run("dashed ID as a short-flag value is left glued to its flag", func(t *testing.T) {
+		in := []string{"proton-cli", "calendar", "events", "create", "-c", dashedID}
+		if got := preprocessArgs(in); !equalSlice(got, in) {
+			t.Errorf("preprocessArgs split a short flag from its value: got %v, want %v", got, in)
+		}
+	})
+	// --flag=value is self-contained, so a positional dashed id right after it is
+	// still a positional and must be protected.
+	t.Run("dashed ID after an =-form flag is still protected", func(t *testing.T) {
+		in := []string{"proton-cli", "calendar", "events", "delete", "--calendar=" + plainID, dashedID}
+		want := []string{"proton-cli", "calendar", "events", "delete", "--calendar=" + plainID, "--", dashedID}
+		if got := preprocessArgs(in); !equalSlice(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	// The shape our embed client now emits: flags first, explicit terminator, ids last.
+	t.Run("client shape with explicit -- is left untouched", func(t *testing.T) {
+		in := []string{"proton-cli", "calendar", "events", "update", "--title", "x", "--", plainID, dashedID}
+		if got := preprocessArgs(in); !equalSlice(got, in) {
+			t.Errorf("preprocessArgs altered an explicitly terminated argv: got %v, want %v", got, in)
+		}
+	})
+}
+
+func TestIsFlagToken(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"--calendar", true},
+		{"-c", true},
+		{"--calendar=abc", false},
+		{"--", false},
+		{"-", false},
+		{"", false},
+		{"list", false},
+		{dashedID, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := isFlagToken(tc.in); got != tc.want {
+				t.Errorf("isFlagToken(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestRewrapFlagError(t *testing.T) {

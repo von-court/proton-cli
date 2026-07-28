@@ -12,10 +12,19 @@ import (
 // ID with a leading '-' (≥60 chars, ends "==", URL-safe base64). It injects
 // "--" immediately before it so cobra treats the rest as positional. A literal
 // "--" already present leaves argv untouched.
+//
+// A token directly after a flag token ("--calendar", "-c") is skipped: it is
+// most likely that flag's value, and injecting a terminator between a flag and
+// its value would hand the flag "--" as its value and strand the ID. Callers
+// that really mean a positional ID there can disambiguate with "--flag=value"
+// or by placing their own "--".
 func preprocessArgs(args []string) []string {
 	for i := 1; i < len(args); i++ {
 		if args[i] == "--" {
 			return args
+		}
+		if i > 1 && isFlagToken(args[i-1]) {
+			continue
 		}
 		if looksLikeDashedProtonID(args[i]) {
 			out := make([]string, 0, len(args)+1)
@@ -26,6 +35,26 @@ func preprocessArgs(args []string) []string {
 		}
 	}
 	return args
+}
+
+// isFlagToken reports whether s is a flag token that may still be awaiting a
+// separate value token ("--calendar", "-c"). The "--flag=value" form is
+// self-contained, so it is not one; neither is a bare "-" nor a dashed Proton
+// ID (which only looks like a flag).
+//
+// This is deliberately an over-approximation: a boolean flag takes no value, so
+// a positional dashed ID right after one is skipped too and stays unprotected.
+// That case then fails loudly through rewrapFlagError's "insert -- before it"
+// hint rather than silently mis-binding a flag to "--", which is the strictly
+// better failure. Callers can always be explicit with "--flag=value" or "--".
+func isFlagToken(s string) bool {
+	if len(s) < 2 || s[0] != '-' {
+		return false
+	}
+	if s == "--" || strings.Contains(s, "=") {
+		return false
+	}
+	return !looksLikeDashedProtonID(s)
 }
 
 // looksLikeDashedProtonID reports whether s starts with a single '-' and is
