@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	pgp "github.com/ProtonMail/gopenpgp/v2/crypto"
@@ -39,18 +40,84 @@ const (
 	eventsMaxPages = 100
 )
 
+var eventQueryTypes = []string{
+	"0", // part-day, starting in the window
+	"1", // part-day, ongoing across the window start
+	"2", // full-day, starting in the window
+	"3", // full-day, ongoing across the window start
+}
+
 func (s *Service) EventsList(ctx context.Context, u *keys.Unlocked, calendarID string, start, end time.Time) ([]Event, error) {
 	ck, err := s.unlockCalendar(ctx, u, calendarID)
 	if err != nil {
 		return nil, err
 	}
-	var out []Event
+	raw, err := s.collectRawEvents(ctx, calendarID, start, end)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Event, 0, len(raw))
+	for _, e := range raw {
+		out = append(out, e.toEvent(ck))
+	}
+	return out, nil
+}
+
+func (s *Service) collectRawEvents(ctx context.Context, calendarID string, start, end time.Time) ([]rawEvent, error) {
+	// The four quadrants are independent queries over the same window, so run them concurrently:
+	// they share this process's session, and serialising them would quadruple the wall-clock of
+	// what is already a network-bound call.
+	var (
+		mu     sync.Mutex
+		wg     sync.WaitGroup
+		perTyp = make([][]rawEvent, len(eventQueryTypes))
+		firstE error
+	)
+	for i, typ := range eventQueryTypes {
+		wg.Add(1)
+		go func(i int, typ string) {
+			defer wg.Done()
+			raw, err := s.eventsPage(ctx, calendarID, start, end, typ)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstE == nil {
+					firstE = err
+				}
+				return
+			}
+			perTyp[i] = raw
+		}(i, typ)
+	}
+	wg.Wait()
+	if firstE != nil {
+		return nil, firstE
+	}
+
+	// An event can match more than one quadrant (e.g. a recurring series is both "starting" and
+	// "ongoing"), so de-duplicate by ID. Iterating perTyp in Type order keeps the output stable.
+	var out []rawEvent
+	seen := make(map[string]struct{})
+	for _, raw := range perTyp {
+		for _, e := range raw {
+			if _, dup := seen[e.ID]; dup {
+				continue
+			}
+			seen[e.ID] = struct{}{}
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (s *Service) eventsPage(ctx context.Context, calendarID string, start, end time.Time, typ string) ([]rawEvent, error) {
+	var out []rawEvent
 	for page := 0; page < eventsMaxPages; page++ {
 		q := url.Values{}
 		q.Set("Start", fmt.Sprintf("%d", start.Unix()))
 		q.Set("End", fmt.Sprintf("%d", end.Unix()))
 		q.Set("Timezone", "UTC")
-		q.Set("Type", "0")
+		q.Set("Type", typ)
 		q.Set("Page", fmt.Sprintf("%d", page))
 		q.Set("PageSize", fmt.Sprintf("%d", eventsPageSize))
 
@@ -63,9 +130,7 @@ func (s *Service) EventsList(ctx context.Context, u *keys.Unlocked, calendarID s
 		if len(r.Events) == 0 {
 			break
 		}
-		for _, e := range r.Events {
-			out = append(out, e.toEvent(ck))
-		}
+		out = append(out, r.Events...)
 		if len(r.Events) < eventsPageSize {
 			break
 		}
