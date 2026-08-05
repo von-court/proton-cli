@@ -290,7 +290,7 @@ func eventsCmd() *cobra.Command {
 	create.Flags().StringArrayVar(&eAttendees, "attendee", nil, "Attendee email; Proton users are added directly, external users are emailed an invite (repeatable)")
 	c.AddCommand(create)
 
-	var uTitle, uLocation, uDescription, uStart, uDuration string
+	var uTitle, uLocation, uDescription, uStart, uDuration, uOccurrence, uScope string
 	update := &cobra.Command{
 		Use: "update CALENDAR_ID EVENT_ID", Short: "Update an event",
 		Args: cobra.ExactArgs(2),
@@ -314,6 +314,44 @@ func eventsCmd() *cobra.Command {
 					end = start.Add(d)
 				}
 			}
+			// Recurring single-occurrence scopes: --occurrence is the edited occurrence's original
+			// start; --scope picks how the edit maps to iCalendar (single override / split / shift).
+			if uOccurrence != "" {
+				occ, err := ical.ParseTime(uOccurrence)
+				if err != nil {
+					return fmt.Errorf("invalid --occurrence: %w", err)
+				}
+				if start.IsZero() || end.IsZero() {
+					return fmt.Errorf("--start and --duration are required with --occurrence")
+				}
+				if c.dryRun("update event with scope %q", uScope) {
+					return nil
+				}
+				switch uScope {
+				case "single", "":
+					id, err := c.App.Calendar.EventCreateOverride(c.Ctx, u, c.Args[0], c.Args[1], occ, start, end, uTitle, uLocation)
+					if err != nil {
+						return err
+					}
+					c.R().ID(id, "Occurrence overridden.")
+					return nil
+				case "following":
+					if err := c.App.Calendar.EventSplitFollowing(c.Ctx, u, c.Args[0], c.Args[1], occ, start, end, uTitle, uLocation); err != nil {
+						return err
+					}
+					c.R().Success("Series split at occurrence.")
+					return nil
+				case "all":
+					if err := c.App.Calendar.EventShiftSeries(c.Ctx, u, c.Args[0], c.Args[1], occ, start, end, uTitle, uLocation); err != nil {
+						return err
+					}
+					c.R().Success("Series shifted.")
+					return nil
+				default:
+					return fmt.Errorf("invalid --scope %q (want single|following|all)", uScope)
+				}
+			}
+
 			if c.dryRun("update event") {
 				return nil
 			}
@@ -329,6 +367,8 @@ func eventsCmd() *cobra.Command {
 	update.Flags().StringVar(&uDescription, "description", "", "New description")
 	update.Flags().StringVar(&uStart, "start", "", "New start time")
 	update.Flags().StringVar(&uDuration, "duration", "", "New duration")
+	update.Flags().StringVar(&uOccurrence, "occurrence", "", "Original start of the edited occurrence (enables recurring single-occurrence scopes)")
+	update.Flags().StringVar(&uScope, "scope", "", "Recurring edit scope with --occurrence: single|following|all")
 	c.AddCommand(update)
 
 	var respStatus string

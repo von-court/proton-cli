@@ -353,7 +353,7 @@ func (s *Service) EventUpdate(ctx context.Context, u *keys.Unlocked, calendarID,
 		return err
 	}
 
-	curTitle, curLoc, curDesc, curRRule, curOrganizer, _, _ := decryptEventCard(r.Event.SharedEvents, r.Event.SharedKeyPacket, ck.calKR, ck.addrKR)
+	curTitle, curLoc, curDesc, _, curOrganizer, curICS, _ := decryptEventCard(r.Event.SharedEvents, r.Event.SharedKeyPacket, ck.calKR, ck.addrKR)
 	if title == "" {
 		title = curTitle
 	}
@@ -370,8 +370,19 @@ func (s *Service) EventUpdate(ctx context.Context, u *keys.Unlocked, calendarID,
 		end = time.Unix(r.Event.EndTime, 0)
 	}
 
-	// Preserve recurrence and organizer across updates (both live in the signed part).
-	signed := ical.SignedVEVENT(r.Event.UID, start, end, r.Event.FullDay == 1, 1, curRRule, curOrganizer)
+	// Preserve recurrence and organizer across updates (both live in the signed part). The
+	// RRULE / RECURRENCE-ID / EXDATE lines are re-emitted verbatim rather than rebuilt from the
+	// RRULE value alone, so an in-place edit cannot silently turn a series — or a single
+	// occurrence override — into a one-off event.
+	//
+	// SEQUENCE is bumped from the event's current value rather than hardcoded: Proton rejects a
+	// regressing SEQUENCE (code 2001), and an override must stay >= its master, so writing a
+	// fixed 1 corrupts any event that has already been edited.
+	extra := ical.RecurrenceLines(curICS)
+	if curOrganizer != "" {
+		extra = append([]string{"ORGANIZER;CN=" + curOrganizer + ":mailto:" + curOrganizer}, extra...)
+	}
+	signed := ical.SignedVEVENTZoned(r.Event.UID, start, end, "", r.Event.FullDay == 1, ical.Sequence(curICS)+1, extra)
 	encrypted := ical.EncryptedVEVENT(title, location, description)
 	signedCard, encCard, _, _, err := pgphelper.EncryptAndSignCardSplit(signed, encrypted, ck.calKR, ck.addrKR, r.Event.SharedKeyPacket)
 	if err != nil {
