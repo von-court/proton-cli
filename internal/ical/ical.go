@@ -517,6 +517,39 @@ func RecurrenceIDLine(t time.Time, tzid string, isDate bool) string {
 	return dateLine("RECURRENCE-ID", t, tzid, isDate)
 }
 
+// EXDATELine builds an EXDATE line excluding one occurrence from a series, in the series' own
+// value type/zone. The zone matters as much as it does for RECURRENCE-ID: an EXDATE written as a
+// bare UTC instant does not cancel an occurrence of a TZID-anchored series, so the "deleted"
+// occurrence would keep coming back.
+func EXDATELine(t time.Time, tzid string, isDate bool) string {
+	return dateLine("EXDATE", t, tzid, isDate)
+}
+
+// HasEXDATE reports whether the decrypted iCalendar text already excludes the given instant, so
+// re-deleting an occurrence is idempotent instead of appending a duplicate EXDATE on every retry.
+// Compared on the rendered line, which normalises the value type and zone.
+func HasEXDATE(ics string, t time.Time, tzid string, isDate bool) bool {
+	want := strings.ToUpper(EXDATELine(t, tzid, isDate))
+	for _, l := range EXDATELines(ics) {
+		// EXDATE is allowed to carry several comma-separated values on one line; compare the
+		// property+params prefix and then look for the instant among the values.
+		u := strings.ToUpper(strings.TrimSpace(l))
+		if u == want {
+			return true
+		}
+		wc, lc := strings.Index(want, ":"), strings.Index(u, ":")
+		if wc < 0 || lc < 0 || want[:wc] != u[:lc] {
+			continue
+		}
+		for _, v := range strings.Split(u[lc+1:], ",") {
+			if strings.TrimSpace(v) == want[wc+1:] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // DTStartInfo reports the TZID and DATE-ness of the first DTSTART in decrypted iCalendar text, so
 // overrides/shifts/splits can re-express times in the series' own zone.
 func DTStartInfo(ics string) (tzid string, isDate bool) {

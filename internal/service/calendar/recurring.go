@@ -179,6 +179,102 @@ func (s *Service) EventShiftSeries(ctx context.Context, u *keys.Unlocked, calend
 	return s.putUpdateEvent(ctx, ck, calendarID, masterEventID, signed, encrypted, m.keyPacket)
 }
 
+// EventDeleteOccurrence cancels ONE occurrence of a series by adding an EXDATE for its original
+// start to the master, leaving the RRULE (and every other occurrence) intact. This is the delete
+// counterpart of EventCreateOverride.
+//
+// It exists because there was no way to express it: `events delete` took only a calendar+event id
+// and always removed the master, so a caller that meant "delete this occurrence" silently destroyed
+// the whole series. Callers must be able to say which occurrence they mean.
+//
+// .. requirement:: The EXDATE is written in the series' own value type/zone (see ical.EXDATELine) —
+//    a bare UTC EXDATE does not cancel an occurrence of a TZID-anchored series.
+// .. note:: Idempotent: an occurrence that is already excluded is left alone rather than
+//    accumulating duplicate EXDATEs across retries.
+// .. weakness:: If the occurrence has a single-occurrence override (a sibling VEVENT with this
+//    RECURRENCE-ID), the EXDATE hides the generated occurrence but the override VEVENT survives and
+//    still renders. Callers delete an override directly by its own event id (it is an ordinary
+//    standalone event), which is what the embed does — an override is never addressed as
+//    "<master>::<occurrence>". Symmetric with EventSplitFollowing, which likewise does not sweep
+//    siblings.
+func (s *Service) EventDeleteOccurrence(ctx context.Context, u *keys.Unlocked, calendarID, masterEventID string, recurrenceID time.Time) error {
+	ck, err := s.unlockCalendar(ctx, u, calendarID)
+	if err != nil {
+		return err
+	}
+	m, err := s.loadMaster(ctx, ck, calendarID, masterEventID)
+	if err != nil {
+		return err
+	}
+	if m.rrule == "" {
+		return fmt.Errorf("event %s is not recurring; delete it directly instead of by occurrence", masterEventID)
+	}
+	tzid, isDate := ical.DTStartInfo(m.ics)
+	extra, changed := excludeOccurrenceLines(m.ics, recurrenceID, tzid, isDate)
+	if !changed {
+		return nil // already cancelled
+	}
+	signed := ical.SignedVEVENTZoned(m.uid, m.start, m.end, tzid, isDate, m.seq+1, extra)
+	encrypted := ical.EncryptedVEVENT(m.title, m.location, m.desc)
+	return s.putUpdateEvent(ctx, ck, calendarID, masterEventID, signed, encrypted, m.keyPacket)
+}
+
+// EventDeleteFollowing removes an occurrence and every later one by truncating the master RRULE
+// with an UNTIL just before it, keeping the earlier occurrences. This is the delete counterpart of
+// EventSplitFollowing (minus the remainder series it would otherwise create).
+//
+// Deleting from the first occurrence onward leaves nothing, so that case removes the master
+// outright rather than writing a series whose rule can never fire.
+//
+// .. weakness:: Overrides that sit after the cut are orphaned rather than deleted — same bound as
+//    EventSplitFollowing. Sweeping them would need an unbounded forward scan (Proton's events query
+//    is windowed and capped at ~3 months, and there is no by-UID lookup), which is not worth adding
+//    to a destructive path that cannot be verified end to end.
+func (s *Service) EventDeleteFollowing(ctx context.Context, u *keys.Unlocked, calendarID, masterEventID string, recurrenceID time.Time) error {
+	ck, err := s.unlockCalendar(ctx, u, calendarID)
+	if err != nil {
+		return err
+	}
+	m, err := s.loadMaster(ctx, ck, calendarID, masterEventID)
+	if err != nil {
+		return err
+	}
+	if m.rrule == "" {
+		return fmt.Errorf("event %s is not recurring; delete it directly instead of by occurrence", masterEventID)
+	}
+	if !recurrenceID.After(m.start) {
+		return s.EventDelete(ctx, u, calendarID, masterEventID)
+	}
+	tzid, isDate := ical.DTStartInfo(m.ics)
+	signed := ical.SignedVEVENTZoned(m.uid, m.start, m.end, tzid, isDate, m.seq+1, truncateBeforeLines(m.ics, m.rrule, recurrenceID))
+	encrypted := ical.EncryptedVEVENT(m.title, m.location, m.desc)
+	return s.putUpdateEvent(ctx, ck, calendarID, masterEventID, signed, encrypted, m.keyPacket)
+}
+
+// excludeOccurrenceLines builds the recurrence lines for a master with one more occurrence excluded:
+// the existing RRULE/EXDATEs verbatim plus an EXDATE for recurrenceID. changed is false when that
+// occurrence is already excluded, so the caller can skip a pointless (and SEQUENCE-bumping) write.
+//
+// Pure so the surgery that decides "does the rest of the series survive?" is unit-testable without
+// Proton credentials or network — the service methods around it are not.
+func excludeOccurrenceLines(ics string, recurrenceID time.Time, tzid string, isDate bool) (extra []string, changed bool) {
+	if ical.HasEXDATE(ics, recurrenceID, tzid, isDate) {
+		return nil, false
+	}
+	// append to a copy: RecurrenceLines' slice must not be aliased into the result.
+	lines := ical.RecurrenceLines(ics)
+	extra = make([]string, 0, len(lines)+1)
+	extra = append(extra, lines...)
+	return append(extra, ical.EXDATELine(recurrenceID, tzid, isDate)), true
+}
+
+// truncateBeforeLines builds the recurrence lines for a master that should stop just before
+// recurrenceID: the RRULE with UNTIL moved back one second, plus the existing EXDATEs. Any
+// RECURRENCE-ID line is deliberately dropped — a master is not an override.
+func truncateBeforeLines(ics, rrule string, recurrenceID time.Time) []string {
+	return append([]string{"RRULE:" + ical.TruncateRRULE(rrule, recurrenceID.Add(-time.Second))}, ical.EXDATELines(ics)...)
+}
+
 // EventSplitFollowing splits a series at the dragged occurrence: the master RRULE is truncated
 // with UNTIL just before it, and a new (open-ended) series is created at the new time carrying the
 // remaining recurrence.

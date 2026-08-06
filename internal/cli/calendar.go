@@ -421,7 +421,12 @@ func eventsCmd() *cobra.Command {
 	respond.Flags().StringVar(&respStatus, "status", "", "Response: accept, tentative, or decline")
 	c.AddCommand(respond)
 
-	c.AddCommand(&cobra.Command{
+	// --occurrence/--scope mirror `events update`: without them delete means "the whole event",
+	// which for a recurring master means the entire series. A caller that wants to cancel one
+	// occurrence has to be able to say so — before these flags existed it could not, and a UI that
+	// offered the choice silently deleted the series instead.
+	var dOccurrence, dScope string
+	del := &cobra.Command{
 		Use: "delete {CALENDAR_ID EVENT_ID | TITLE}", Short: "Delete an event",
 		Args: cobra.RangeArgs(1, 2),
 		RunE: run([]Step{stepAuth, stepResolve}, func(c *Invocation) error {
@@ -433,6 +438,38 @@ func eventsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// A scope without an occurrence cannot be honoured, and defaulting it to "all" is
+			// exactly the destructive surprise these flags exist to prevent — so refuse.
+			if dScope != "" && dScope != "all" && dOccurrence == "" {
+				return fmt.Errorf("--scope %q requires --occurrence", dScope)
+			}
+			if dOccurrence != "" {
+				occ, err := ical.ParseTime(dOccurrence)
+				if err != nil {
+					return fmt.Errorf("invalid --occurrence: %w", err)
+				}
+				if c.dryRun("delete event %s in calendar %s with scope %q", eventID, calID, dScope) {
+					return nil
+				}
+				switch dScope {
+				case "single", "":
+					if err := c.App.Calendar.EventDeleteOccurrence(c.Ctx, u, calID, eventID, occ); err != nil {
+						return err
+					}
+					c.R().Success("Occurrence deleted.")
+					return nil
+				case "following":
+					if err := c.App.Calendar.EventDeleteFollowing(c.Ctx, u, calID, eventID, occ); err != nil {
+						return err
+					}
+					c.R().Success("Occurrence and following deleted.")
+					return nil
+				case "all":
+					break // fall through to the whole-event delete below
+				default:
+					return fmt.Errorf("invalid --scope %q (want single|following|all)", dScope)
+				}
+			}
 			if c.dryRun("delete event %s in calendar %s", eventID, calID) {
 				return nil
 			}
@@ -442,6 +479,9 @@ func eventsCmd() *cobra.Command {
 			c.R().Success("Event deleted.")
 			return nil
 		}),
-	})
+	}
+	del.Flags().StringVar(&dOccurrence, "occurrence", "", "Original start of the occurrence to delete (enables recurring delete scopes)")
+	del.Flags().StringVar(&dScope, "scope", "", "Recurring delete scope with --occurrence: single|following|all")
+	c.AddCommand(del)
 	return c
 }
